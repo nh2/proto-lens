@@ -28,6 +28,7 @@ import Data.Functor ((<$>))
 #endif
 
 import Control.Monad (filterM, forM_, when)
+import qualified Data.ByteString as BS
 import qualified Distribution.InstalledPackageInfo as InstalledPackageInfo
 import Distribution.PackageDescription
     ( PackageDescription(..)
@@ -52,8 +53,10 @@ import qualified Distribution.Simple.PackageIndex as PackageIndex
 import Distribution.Simple.Setup (fromFlag, copyDest, copyVerbosity)
 import Distribution.Simple.Utils
     ( createDirectoryIfMissingVerbose
+    , getDirectoryContentsRecursive
     , installOrdinaryFile
     , matchFileGlob
+    , moreRecentFile
     )
 import Distribution.Simple
     ( defaultMainWithHooks
@@ -73,7 +76,9 @@ import System.Directory
     ( createDirectoryIfMissing
     , doesDirectoryExist
     , findExecutable
+    , doesFileExist
     , removeDirectoryRecursive
+    , renameFile
     )
 import System.IO (hPutStrLn, stderr)
 import System.Process (callProcess)
@@ -178,10 +183,40 @@ generateSources root l files = do
                      [ InstalledPackageInfo.dataDir info </> protoLensImportsPrefix
                      | info <- collectDeps l
                      ]
-    generateProtosWithImports (root : importDirs) (autogenModulesDir l)
+    -- Generate .hs files into a temporary directory, then move them over
+    -- to the target (autogen) directory only if they are different from
+    -- what's already there. This way, we don't needlessly touch the generated
+    -- .hs files when nothing changes, and thus don't needlessly make GHC
+    -- recompile them (as it considers their modification times for that).
+    -- See https://github.com/google/proto-lens/issues/176
+    let tmpAutogenModulesDir = autogenModulesDir l ++ "-protoc-tmpOutDir"
+    -- Generate .hs files into temp dir.
+    generateProtosWithImports (root : importDirs) tmpAutogenModulesDir
                               -- Applying 'root </>' does nothing if the path is already
                               -- absolute.
                               (map (root </>) files)
+    -- Discover generated files.
+    -- Beware `getDirectoryContentsRecursive` is lazy IO.
+    files <- getDirectoryContentsRecursive tmpAutogenModulesDir
+    -- Move files to autogen dir only if file contents are different.
+    forM_ files $ \pathRelativeToTmpDir -> do
+        let sourcePath = tmpAutogenModulesDir </> pathRelativeToTmpDir
+        let targetPath = autogenModulesDir l </> pathRelativeToTmpDir
+        identical <- do
+            targetExists <- doesFileExist targetPath
+            if not targetExists
+                then return False
+                else do
+                    -- This could be done in a streaming fashion,
+                    -- but since the .hs files usually easily fit
+                    -- into RAM, this is OK.
+                    sourceContents <- BS.readFile sourcePath
+                    targetContents <- BS.readFile targetPath
+                    return (sourceContents == targetContents)
+        -- Do the move if necessary.
+        when (not identical) $ do
+            createDirectoryIfMissing True (takeDirectory targetPath)
+            renameFile sourcePath targetPath
 
 -- | Copy each .proto file into the installed "data-dir" path,
 -- so that it can be included by other packages that depend on this one.
@@ -202,7 +237,9 @@ copyProtosToDataDir verb root destDir files = do
         let destFile = destDir </> f
         createDirectoryIfMissingVerbose verb True
             (takeDirectory destFile)
-        installOrdinaryFile verb srcFile destFile
+        shouldCopy <- srcFile `moreRecentFile` destFile
+        when shouldCopy $ do
+            installOrdinaryFile verb srcFile destFile
 
 -- | Imports are stored as $datadir/proto-lens-imports/**/*.proto.
 protoLensImportsPrefix :: FilePath
