@@ -14,6 +14,7 @@
 --
 -- See @README.md@ for instructions on how to use proto-lens with Cabal.
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE BangPatterns #-}
 module Data.ProtoLens.Setup
     ( defaultMainGeneratingProtos
     , defaultMainGeneratingSpecificProtos
@@ -27,6 +28,7 @@ module Data.ProtoLens.Setup
 import Data.Functor ((<$>))
 #endif
 
+import Control.DeepSeq (force)
 import Control.Monad (filterM, forM_, when)
 import qualified Data.ByteString as BS
 import qualified Distribution.InstalledPackageInfo as InstalledPackageInfo
@@ -196,8 +198,9 @@ generateSources root l files = do
                               -- absolute.
                               (map (root </>) files)
     -- Discover generated files.
-    -- Beware `getDirectoryContentsRecursive` is lazy IO.
-    files <- getDirectoryContentsRecursive tmpAutogenModulesDir
+    -- `getDirectoryContentsRecursive` is lazy IO, so we `force` through
+    -- the list to make it strict hereinafter.
+    !files <- force <$> getDirectoryContentsRecursive tmpAutogenModulesDir
     -- Move files to autogen dir only if file contents are different.
     forM_ files $ \pathRelativeToTmpDir -> do
         let sourcePath = tmpAutogenModulesDir </> pathRelativeToTmpDir
